@@ -39,7 +39,7 @@ struct IXRealtimeAudioSessionOwners {
         activationOrder.append(ownerID)
     }
 
-    mutating func release(ownerID: UUID) -> Release {
+    mutating func release(ownerID: UUID, forceReconfigure: Bool = false) -> Release {
         guard let releasedProfile = profilesByOwnerID.removeValue(
             forKey: ownerID
         ) else {
@@ -55,7 +55,8 @@ struct IXRealtimeAudioSessionOwners {
         // The applied configuration belongs to the most recent owner. Leaving
         // an older owner, or handing over to an identical profile, does not
         // need another category change and its route-change notifications.
-        guard wasCurrent, remainingProfile != releasedProfile else {
+        guard wasCurrent,
+              forceReconfigure || remainingProfile != releasedProfile else {
             return .unchanged
         }
         return .reconfigure(remainingProfile)
@@ -70,6 +71,7 @@ actor IXRealtimeAppleAudioSession {
     static let shared = IXRealtimeAppleAudioSession()
 
     private var owners = IXRealtimeAudioSessionOwners()
+    private var configurationValid = true
 
     func activate(
         ownerID: UUID,
@@ -97,6 +99,7 @@ actor IXRealtimeAppleAudioSession {
         try Task.checkCancellation()
         try Self.configureVoiceSession(profile: profile)
         owners.activate(ownerID: ownerID, profile: profile)
+        configurationValid = true
     }
 
     /// AVAudioSession deliberately invokes its permission callback on a TCC
@@ -111,12 +114,19 @@ actor IXRealtimeAppleAudioSession {
     }
 
     func deactivate(ownerID: UUID) async {
-        switch owners.release(ownerID: ownerID) {
+        switch owners.release(ownerID: ownerID,
+                              forceReconfigure: !configurationValid) {
         case .unchanged:
             return
         case .reconfigure(let profile):
-            try? Self.configureVoiceSession(profile: profile)
+            do {
+                try Self.configureVoiceSession(profile: profile)
+                configurationValid = true
+            } catch {
+                configurationValid = false
+            }
         case .deactivate:
+            configurationValid = true
             try? AVAudioSession.sharedInstance().setActive(
                 false,
                 options: .notifyOthersOnDeactivation
@@ -131,9 +141,12 @@ actor IXRealtimeAppleAudioSession {
     /// Reapplies the shared voice-chat configuration after an interruption,
     /// route change, or media-services reset without changing ownership.
     func recover(ownerID: UUID) async throws {
-        guard owners.currentOwnerID == ownerID,
-              let profile = owners.profile(for: ownerID) else { return }
+        guard owners.profile(for: ownerID) != nil else { return }
+        configurationValid = false
+        guard let currentID = owners.currentOwnerID,
+              let profile = owners.profile(for: currentID) else { return }
         try Self.configureVoiceSession(profile: profile)
+        configurationValid = true
     }
 
     /// Keep category changes synchronous on this actor's serial executor. An

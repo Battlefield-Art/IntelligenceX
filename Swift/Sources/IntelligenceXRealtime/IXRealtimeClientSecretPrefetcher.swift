@@ -132,6 +132,7 @@ public actor IXRealtimeClientSecretPrefetcher {
     private var prepared: PreparedSecret?
     private var running: RunningMint?
     private var joined: [UUID: JoinedMint] = [:]
+    private var onDemand: [UUID: JoinedMint] = [:]
     private var generation: UInt64 = 0
 
     /// Creates a prefetcher that mints with `client`.
@@ -243,13 +244,26 @@ public actor IXRealtimeClientSecretPrefetcher {
             }
         }
         let mintGeneration = generation
-        let secret = try await mint(request)
+        let mint = mint
+        let id = UUID()
+        let task = Task.detached { try await mint(request) }
+        let signal = JoinedMintSignal()
+        onDemand[id] = JoinedMint(task: task, signal: signal)
+        Task { signal.resolve(await task.result) }
+        let result = await withTaskCancellationHandler {
+            await signal.value()
+        } onCancel: {
+            signal.resolve(.failure(CancellationError()))
+            task.cancel()
+        }
+        onDemand[id] = nil
         // A secret minted across an invalidation may belong to the previous
         // authority; the start that asked for it must begin again.
         try Task.checkCancellation()
         guard mintGeneration == generation else {
             throw CancellationError()
         }
+        let secret = try result.get()
         guard isReusable(secret) else {
             throw IXCodexError.invalidResponse(
                 "Realtime client secret expires before connection setup can complete."
@@ -269,6 +283,10 @@ public actor IXRealtimeClientSecretPrefetcher {
         for join in joined.values {
             join.signal.resolve(.failure(CancellationError()))
             join.task.cancel()
+        }
+        for direct in onDemand.values {
+            direct.signal.resolve(.failure(CancellationError()))
+            direct.task.cancel()
         }
     }
 

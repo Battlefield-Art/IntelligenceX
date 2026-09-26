@@ -90,6 +90,19 @@ final class IXRealtimeAudioSessionOwnershipTests: XCTestCase {
         XCTAssertEqual(owners.currentOwnerID, phone)
     }
 
+    func testInvalidAudioConfigurationReappliesEqualProfileOnRelease() {
+        var owners = IXRealtimeAudioSessionOwners()
+        let connected = UUID()
+        let reservation = UUID()
+        owners.activate(ownerID: connected, profile: .voiceConversation)
+        owners.activate(ownerID: reservation, profile: .voiceConversation)
+
+        XCTAssertEqual(owners.release(ownerID: reservation,
+                                      forceReconfigure: true),
+                       .reconfigure(.voiceConversation))
+        XCTAssertEqual(owners.currentOwnerID, connected)
+    }
+
     func testReactivatingOwnerMovesItToTheFront() {
         var owners = IXRealtimeAudioSessionOwners()
         let first = UUID()

@@ -131,6 +131,56 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
         XCTAssertTrue(wasCancelled)
     }
 
+    func testCancelledOnDemandMintSettlesBeforeUncooperativeMinterReturns() async throws {
+        let minter = SecretMinter(
+            expiresAt: referenceDate.addingTimeInterval(300),
+            holdsFirstMint: true,
+            firstMintIgnoresCancellation: true
+        )
+        let prefetcher = makePrefetcher(minter)
+        let take = Task { try await prefetcher.takeSecret(for: Self.request()) }
+        await minter.waitUntilFirstMintStarted()
+        take.cancel()
+        let settled = expectation(description: "Cancelled on-demand mint settles")
+        Task {
+            do {
+                _ = try await take.value
+                XCTFail("A cancelled mint must fail")
+            } catch is CancellationError {
+            } catch {
+                XCTFail("Expected cancellation, got \(error)")
+            }
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 1)
+        await minter.releaseFirstMint()
+    }
+
+    func testInvalidatedOnDemandMintSettlesBeforeUncooperativeMinterReturns() async throws {
+        let minter = SecretMinter(
+            expiresAt: referenceDate.addingTimeInterval(300),
+            holdsFirstMint: true,
+            firstMintIgnoresCancellation: true
+        )
+        let prefetcher = makePrefetcher(minter)
+        let take = Task { try await prefetcher.takeSecret(for: Self.request()) }
+        await minter.waitUntilFirstMintStarted()
+        await prefetcher.invalidate()
+        let settled = expectation(description: "Invalidated on-demand mint settles")
+        Task {
+            do {
+                _ = try await take.value
+                XCTFail("An invalidated mint must fail")
+            } catch is CancellationError {
+            } catch {
+                XCTFail("Expected cancellation, got \(error)")
+            }
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 1)
+        await minter.releaseFirstMint()
+    }
+
     func testSecretCloseToExpiryIsNotReused() async throws {
         let minter = SecretMinter(expiresAt: referenceDate.addingTimeInterval(20))
         let prefetcher = makePrefetcher(minter, margin: .seconds(30))
