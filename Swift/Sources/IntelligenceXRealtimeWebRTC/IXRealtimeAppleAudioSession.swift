@@ -94,6 +94,7 @@ actor IXRealtimeAppleAudioSession {
             )
         }
 
+        try Task.checkCancellation()
         try Self.configureVoiceSession(profile: profile)
         owners.activate(ownerID: ownerID, profile: profile)
     }
@@ -169,6 +170,7 @@ actor IXRealtimeAppleAudioSession {
         ownerID: UUID,
         profile: IXRealtimeAudioSessionProfile
     ) async throws {
+        try Task.checkCancellation()
         owners.activate(ownerID: ownerID, profile: profile)
     }
     func deactivate(ownerID: UUID) async {

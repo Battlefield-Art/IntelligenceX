@@ -73,6 +73,10 @@ public struct IXRealtimeAudioSessionReservation: Sendable, Hashable {
             ownerID: reservation.ownerID,
             profile: profile
         )
+        if Task.isCancelled {
+            await reservation.release()
+            throw CancellationError()
+        }
         return reservation
     }
 

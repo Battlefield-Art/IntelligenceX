@@ -119,6 +119,21 @@ final class IXRealtimeAudioSessionOwnershipTests: XCTestCase {
         let finalCount = await IXRealtimeAppleAudioSession.shared.activeOwnerCount
         XCTAssertEqual(finalCount, initialCount)
     }
+
+    func testCancelledPreparationDoesNotHoldAudioSession() async throws {
+        let initialCount = await IXRealtimeAppleAudioSession.shared.activeOwnerCount
+        let preparation = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await IXRealtimeAudioSessionReservation.prepare()
+        }
+        do {
+            _ = try await preparation.value
+            XCTFail("Cancelled preparation must not return a held reservation")
+        } catch is CancellationError {
+        }
+        let finalCount = await IXRealtimeAppleAudioSession.shared.activeOwnerCount
+        XCTAssertEqual(finalCount, initialCount)
+    }
 }
 
 private final class CreatedObject: Sendable {}

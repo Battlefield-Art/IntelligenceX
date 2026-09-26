@@ -81,6 +81,56 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
         XCTAssertNotEqual(joined.secret.value, second.secret.value)
     }
 
+    func testCancelledJoinSettlesBeforeUncooperativeMintReturns() async throws {
+        let minter = SecretMinter(
+            expiresAt: referenceDate.addingTimeInterval(300),
+            holdsFirstMint: true,
+            firstMintIgnoresCancellation: true
+        )
+        let prefetcher = makePrefetcher(minter)
+        let request = Self.request()
+        await prefetcher.prefetch(request)
+        await minter.waitUntilFirstMintStarted()
+        let take = Task { try await prefetcher.takeSecret(for: request) }
+        try await waitUntilJoined(prefetcher)
+        take.cancel()
+        let settled = expectation(description: "Cancelled join settles before mint returns")
+        Task {
+            do {
+                _ = try await take.value
+                XCTFail("A cancelled join must fail")
+            } catch is CancellationError {
+            } catch {
+                XCTFail("Expected cancellation, got \(error)")
+            }
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 1)
+        await minter.releaseFirstMint()
+    }
+
+    func testCancelledJoinCancelsClaimedMint() async throws {
+        let minter = SecretMinter(
+            expiresAt: referenceDate.addingTimeInterval(300),
+            holdsFirstMint: true
+        )
+        let prefetcher = makePrefetcher(minter)
+        let request = Self.request()
+        await prefetcher.prefetch(request)
+        await minter.waitUntilFirstMintStarted()
+        let take = Task { try await prefetcher.takeSecret(for: request) }
+        try await waitUntilJoined(prefetcher)
+        take.cancel()
+        await minter.releaseFirstMint()
+        do {
+            _ = try await take.value
+            XCTFail("A cancelled join must fail")
+        } catch is CancellationError {
+        }
+        let wasCancelled = await minter.firstMintWasCancelled
+        XCTAssertTrue(wasCancelled)
+    }
+
     func testSecretCloseToExpiryIsNotReused() async throws {
         let minter = SecretMinter(expiresAt: referenceDate.addingTimeInterval(20))
         let prefetcher = makePrefetcher(minter, margin: .seconds(30))
@@ -92,9 +142,14 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
         let isPrepared = await prefetcher.hasPreparedSecret(for: request)
         XCTAssertFalse(isPrepared)
 
-        let result = try await prefetcher.takeSecret(for: request)
-        XCTAssertEqual(result.source, .minted)
-        XCTAssertEqual(result.secret.value, "secret-2")
+        do {
+            _ = try await prefetcher.takeSecret(for: request)
+            XCTFail("A secret expiring before connection setup must be rejected")
+        } catch let error as IXCodexError {
+            guard case .invalidResponse = error else {
+                return XCTFail("Expected invalidResponse, got \(error)")
+            }
+        }
     }
 
     func testDifferentScopeOrOptionsNeverReceivePreparedSecret() async throws {
@@ -138,7 +193,7 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
         XCTAssertEqual(result.secret.value, "secret-2")
     }
 
-    func testInvalidateDuringJoinMintsReplacementSecret() async throws {
+    func testInvalidateDuringJoinRejectsOldAuthority() async throws {
         let minter = SecretMinter(
             expiresAt: referenceDate.addingTimeInterval(300),
             holdsFirstMint: true,
@@ -152,11 +207,21 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
         let take = Task { try await prefetcher.takeSecret(for: request) }
         try await waitUntilJoined(prefetcher)
         await prefetcher.invalidate()
+        let settled = expectation(description: "Invalidated join settles before mint returns")
+        Task {
+            do {
+                _ = try await take.value
+                XCTFail("A joined start must re-evaluate authority after invalidation")
+            } catch is CancellationError {
+            } catch {
+                XCTFail("Expected cancellation, got \(error)")
+            }
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 1)
         await minter.releaseFirstMint()
-
-        let result = try await take.value
-        XCTAssertEqual(result.source, .minted)
-        XCTAssertEqual(result.secret.value, "secret-2")
+        let mintCount = await minter.count
+        XCTAssertEqual(mintCount, 1)
     }
 
     func testInvalidateDuringOnDemandMintDiscardsTheSecret() async throws {
@@ -165,7 +230,8 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
             holdsFirstMint: true
         )
         let prefetcher = makePrefetcher(minter)
-        let take = Task { try await prefetcher.takeSecret(for: Self.request()) }
+        let request = Self.request()
+        let take = Task { try await prefetcher.takeSecret(for: request) }
         await minter.waitUntilFirstMintStarted()
         await prefetcher.invalidate()
         await minter.releaseFirstMint()
@@ -214,7 +280,12 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
             instructions: "Private home context.",
             voice: "marin",
             reasoningEffort: .low,
-            clientSecretLifetime: .seconds(300)
+            clientSecretLifetime: .seconds(300),
+            inputTranscription: .init(
+                prompt: "Private device names.",
+                languageHints: ["en"],
+                keywords: ["front door"]
+            )
         )
 
         let request = IXRealtimeClientSecretRequest.minimal(
@@ -230,7 +301,10 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
         XCTAssertEqual(request.options.voice, "marin")
         XCTAssertEqual(request.options.reasoningEffort, .low)
         XCTAssertEqual(request.options.clientSecretLifetime, .seconds(300))
-        XCTAssertEqual(request.options.inputTranscription, options.inputTranscription)
+        XCTAssertEqual(request.options.inputTranscription?.model, options.inputTranscription?.model)
+        XCTAssertNil(request.options.inputTranscription?.prompt)
+        XCTAssertEqual(request.options.inputTranscription?.languageHints, ["en"])
+        XCTAssertEqual(request.options.inputTranscription?.keywords, [])
     }
 
     func testClientBackedPrefetcherMintsMinimalSessionPayload() async throws {
@@ -347,6 +421,7 @@ private actor SecretMinter {
     private var firstMintReleased = false
     private var firstMintStartWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var requests: [IXRealtimeClientSecretRequest] = []
+    private(set) var firstMintWasCancelled = false
 
     init(
         expiresAt: Date,
@@ -372,6 +447,7 @@ private actor SecretMinter {
                 await withCheckedContinuation { firstMintRelease = $0 }
             }
             if !firstMintIgnoresCancellation {
+                firstMintWasCancelled = Task.isCancelled
                 try Task.checkCancellation()
             }
         }

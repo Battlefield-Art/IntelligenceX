@@ -32,8 +32,10 @@ public struct IXRealtimeClientSecretRequest: Sendable, Equatable {
     ///
     /// The minted secret keeps the model, voice, audio, turn-detection,
     /// transcription, reasoning, and lifetime settings of `options`, but
-    /// carries no instructions and no tools and never creates responses on
-    /// its own. Such a secret holds no conversation data, so it can be minted
+    /// carries no instructions, tools, transcription prompt, or transcription
+    /// keywords and never creates responses on its own. Language hints and
+    /// transcription timing remain configured. Such a secret holds no
+    /// conversation data, so it can be minted
     /// well before the person starts talking. Send
     /// `IXRealtimeClientEvent.sessionUpdate(options:tools:)` as soon as the
     /// session is ready; it restores `createsResponsesAutomatically` from the
@@ -45,6 +47,8 @@ public struct IXRealtimeClientSecretRequest: Sendable, Equatable {
         var minimalOptions = options
         minimalOptions.instructions = ""
         minimalOptions.createsResponsesAutomatically = false
+        minimalOptions.inputTranscription?.prompt = nil
+        minimalOptions.inputTranscription?.keywords = []
         return IXRealtimeClientSecretRequest(
             options: minimalOptions,
             tools: [],
@@ -91,7 +95,7 @@ public struct IXRealtimePrefetchedClientSecret: Sendable, Equatable {
 /// - `invalidate()` drops every prepared secret and cancels a running mint.
 ///   Call it on sign-out, account change, or loss of entitlement so no secret
 ///   outlives its authority. A start that joined an invalidated prefetch
-///   mints a new secret instead of using the discarded one.
+///   fails so the caller can restart with current authority.
 ///
 /// Prefer `IXRealtimeClientSecretRequest.minimal(options:scope:)` for
 /// prefetching, so no instructions, tools, or home data are minted into a
@@ -115,6 +119,11 @@ public actor IXRealtimeClientSecretPrefetcher {
         let task: Task<IXRealtimeClientSecret, Error>
     }
 
+    private struct JoinedMint {
+        let task: Task<IXRealtimeClientSecret, Error>
+        let signal: JoinedMintSignal
+    }
+
     /// The lifetime a prepared secret must still have to be handed out.
     public let minimumRemainingLifetime: Duration
 
@@ -122,7 +131,7 @@ public actor IXRealtimeClientSecretPrefetcher {
     private let now: @Sendable () -> Date
     private var prepared: PreparedSecret?
     private var running: RunningMint?
-    private var joined: [UUID: Task<IXRealtimeClientSecret, Error>] = [:]
+    private var joined: [UUID: JoinedMint] = [:]
     private var generation: UInt64 = 0
 
     /// Creates a prefetcher that mints with `client`.
@@ -207,8 +216,8 @@ public actor IXRealtimeClientSecretPrefetcher {
     /// still minting, and otherwise minting on demand.
     ///
     /// A secret is handed out at most once; every Realtime connection needs
-    /// its own. Waiting for a joined prefetch is bounded by the minting
-    /// client's request deadline.
+    /// its own. Cancelling a joined start or invalidating its authority
+    /// releases the waiter even if a custom minter ignores cancellation.
     ///
     /// - Throws: The on-demand mint's error, or `CancellationError` when the
     ///   calling task is cancelled or `invalidate()` runs while this call
@@ -237,21 +246,29 @@ public actor IXRealtimeClientSecretPrefetcher {
         let secret = try await mint(request)
         // A secret minted across an invalidation may belong to the previous
         // authority; the start that asked for it must begin again.
+        try Task.checkCancellation()
         guard mintGeneration == generation else {
             throw CancellationError()
+        }
+        guard isReusable(secret) else {
+            throw IXCodexError.invalidResponse(
+                "Realtime client secret expires before connection setup can complete."
+            )
         }
         return .init(secret: secret, source: .minted)
     }
 
     /// Drops every prepared secret and cancels a running prefetch. Starts
-    /// that already joined the cancelled prefetch mint a new secret.
+    /// that already joined the cancelled prefetch fail so their caller can
+    /// re-evaluate authority before trying again.
     public func invalidate() {
         generation &+= 1
         prepared = nil
         running?.task.cancel()
         running = nil
-        for task in joined.values {
-            task.cancel()
+        for join in joined.values {
+            join.signal.resolve(.failure(CancellationError()))
+            join.task.cancel()
         }
     }
 
@@ -271,17 +288,28 @@ public actor IXRealtimeClientSecretPrefetcher {
     /// Claims a matching running prefetch, waits for it, and consumes its
     /// result. Claiming removes it from `running`, so a concurrent start
     /// cannot receive the same secret and mints its own instead. Returns nil
-    /// when the prefetch failed, was invalidated, or produced a secret that is
-    /// no longer reusable, so the caller mints on demand.
+    /// when the prefetch failed or produced a secret that is no longer
+    /// reusable, so the caller mints on demand. Invalidation throws.
     private func join(_ mint: RunningMint) async throws -> IXRealtimeClientSecret? {
         running = nil
-        joined[mint.id] = mint.task
-        // Waiting is bounded by the minting client's own request deadline.
-        let result = await mint.task.result
+        let task = mint.task
+        let signal = JoinedMintSignal()
+        joined[mint.id] = JoinedMint(task: task, signal: signal)
+        Task {
+            signal.resolve(await task.result)
+        }
+        let result = await withTaskCancellationHandler {
+            await signal.value()
+        } onCancel: {
+            signal.resolve(.failure(CancellationError()))
+            task.cancel()
+        }
         joined[mint.id] = nil
         try Task.checkCancellation()
-        guard mint.generation == generation,
-              case .success(let secret) = result,
+        guard mint.generation == generation else {
+            throw CancellationError()
+        }
+        guard case .success(let secret) = result,
               isReusable(secret) else {
             return nil
         }
@@ -309,6 +337,36 @@ public actor IXRealtimeClientSecretPrefetcher {
     private func isReusable(_ secret: IXRealtimeClientSecret) -> Bool {
         secret.expiresAt.timeIntervalSince(now()) >=
             minimumRemainingLifetime.ixTimeInterval
+    }
+}
+
+/// Completes a claimed mint's single waiter on the first result, cancellation,
+/// or authority invalidation. A custom minter may keep running after cancellation.
+private final class JoinedMintSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<IXRealtimeClientSecret, Error>?
+    private var continuation: CheckedContinuation<Result<IXRealtimeClientSecret, Error>, Never>?
+
+    func value() async -> Result<IXRealtimeClientSecret, Error> {
+        await withCheckedContinuation { continuation in
+            let ready = lock.withLock { () -> Result<IXRealtimeClientSecret, Error>? in
+                if let result { return result }
+                self.continuation = continuation
+                return nil
+            }
+            if let ready { continuation.resume(returning: ready) }
+        }
+    }
+
+    func resolve(_ result: Result<IXRealtimeClientSecret, Error>) {
+        let waiter = lock.withLock { () -> CheckedContinuation<Result<IXRealtimeClientSecret, Error>, Never>? in
+            guard self.result == nil else { return nil }
+            self.result = result
+            let waiter = continuation
+            continuation = nil
+            return waiter
+        }
+        waiter?.resume(returning: result)
     }
 }
 
