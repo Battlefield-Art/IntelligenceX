@@ -52,11 +52,10 @@ struct IXRealtimeAudioSessionOwners {
         else {
             return .deactivate
         }
-        // The applied configuration belongs to the most recent owner. Leaving
-        // an older owner, or handing over to an identical profile, does not
-        // need another category change and its route-change notifications.
-        guard wasCurrent,
-              forceReconfigure || remainingProfile != releasedProfile else {
+        // An invalidated audio session needs its newest remaining owner's
+        // profile reapplied even when the departing owner was older.
+        guard forceReconfigure ||
+              (wasCurrent && remainingProfile != releasedProfile) else {
             return .unchanged
         }
         return .reconfigure(remainingProfile)

@@ -138,7 +138,8 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
             firstMintIgnoresCancellation: true
         )
         let prefetcher = makePrefetcher(minter)
-        let take = Task { try await prefetcher.takeSecret(for: Self.request()) }
+        let request = Self.request()
+        let take = Task { try await prefetcher.takeSecret(for: request) }
         await minter.waitUntilFirstMintStarted()
         take.cancel()
         let settled = expectation(description: "Cancelled on-demand mint settles")
@@ -163,7 +164,8 @@ final class IXRealtimeClientSecretPrefetcherTests: XCTestCase {
             firstMintIgnoresCancellation: true
         )
         let prefetcher = makePrefetcher(minter)
-        let take = Task { try await prefetcher.takeSecret(for: Self.request()) }
+        let request = Self.request()
+        let take = Task { try await prefetcher.takeSecret(for: request) }
         await minter.waitUntilFirstMintStarted()
         await prefetcher.invalidate()
         let settled = expectation(description: "Invalidated on-demand mint settles")
